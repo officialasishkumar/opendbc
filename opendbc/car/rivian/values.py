@@ -22,6 +22,7 @@ class ModelYear(StrEnum):
   P_2023 = "P"
   R_2024 = "R"
   S_2025 = "S"
+  T_2026 = "T"  # Gen2 support
 
 
 @dataclass
@@ -33,7 +34,10 @@ class RivianCarDocs(CarDocs):
 
 @dataclass
 class RivianPlatformConfig(PlatformConfig):
-  dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: 'rivian_primary_actuator', Bus.radar: 'rivian_mando_front_radar_generated'})
+  dbc_dict: DbcDict = field(default_factory=lambda: {
+    Bus.pt: 'rivian_primary_actuator',
+    Bus.radar: 'rivian_mando_front_radar',  # corrected filename
+  })
   wmis: set[WMI] = field(default_factory=set)
   lines: set[ModelLine] = field(default_factory=set)
   years: set[ModelYear] = field(default_factory=set)
@@ -52,19 +56,42 @@ class CAR(Platforms):
     years={ModelYear.N_2022, ModelYear.P_2023, ModelYear.R_2024},
   )
 
+  RIVIAN_R1_GEN2 = RivianPlatformConfig(
+    [
+      RivianCarDocs("Rivian R1S 2025+"),
+      RivianCarDocs("Rivian R1T 2025+"),
+    ],
+    # Gen2 specs - updated mass and refined steer ratio for improved lateral control
+    CarSpecs(mass=3100., wheelbase=3.08, steerRatio=14.8),
+    wmis={WMI.RIVIAN_TRUCK, WMI.RIVIAN_MPV},
+    lines={ModelLine.R1T, ModelLine.R1S},
+    years={ModelYear.S_2025, ModelYear.T_2026},
+  )
+
 
 def match_fw_to_car_fuzzy(live_fw_versions, vin, offline_fw_versions) -> set[str]:
   # Rivian VIN reference: https://www.rivianforums.com/forum/threads/rivian-vin-decoder.1546
   vin_obj = Vin(vin)
-  line = vin_obj.vds[:1]
-  year = vin_obj.vis[:1]
+  # Convert the single-character VDS and VIS identifiers into their Enum counterparts when possible.
+  try:
+    line = ModelLine(vin_obj.vds[:1])  # e.g. "T" -> ModelLine.R1T
+  except ValueError:
+    line = None
 
-  candidates = set()
+  try:
+    year = ModelYear(vin_obj.vis[:1])  # e.g. "S" -> ModelYear.S_2025
+  except ValueError:
+    year = None
+
+  candidates: set[Platforms] = set()
   for platform in CAR:
-    if vin_obj.wmi in platform.config.wmis and line in platform.config.lines and year in platform.config.years:
+    if (vin_obj.wmi in platform.config.wmis and
+        line in platform.config.lines and
+        year in platform.config.years):
       candidates.add(platform)
 
-  return {str(c) for c in candidates}
+  # Return the Platform Enum strings (mirrors behaviour of other brands) so that callers can compare via str().
+  return {str(p) for p in candidates}
 
 
 RIVIAN_VERSION_REQUEST = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + \
@@ -115,8 +142,15 @@ class CarControllerParams:
   # 250 is ~2.8 m/s^2 above 17 m/s, then linearly ramps to ~1.6 m/s^2 from 17 m/s to 9 m/s
   # TODO: it is theorized older models have different steering racks and achieve down to half the
   #  lateral acceleration referenced here at all speeds. detect this and ship a torque increase for those models
-  STEER_MAX = 250  # 350 is intended to maintain lateral accel, not increase it
-  STEER_MAX_LOOKUP = [9, 17], [350, 250]
+  
+  # Gen1 parameters (conservative)
+  STEER_MAX_GEN1 = 250  # 350 is intended to maintain lateral accel, not increase it
+  STEER_MAX_LOOKUP_GEN1 = [9, 17], [350, 250]
+  
+  # Gen2 parameters (enhanced lateral control)
+  STEER_MAX_GEN2 = 300  # Increased max torque for better responsiveness
+  STEER_MAX_LOOKUP_GEN2 = [9, 17, 30], [400, 300, 280]  # More refined speed-based curve
+  
   STEER_STEP = 1
   STEER_DELTA_UP = 3  # torque increase per refresh
   STEER_DELTA_DOWN = 5  # torque decrease per refresh
@@ -128,7 +162,18 @@ class CarControllerParams:
   ACCEL_MAX = 2.0  # m/s^2
 
   def __init__(self, CP):
-    pass
+    # Set generation-specific parameters
+    if CP.carFingerprint in (CAR.RIVIAN_R1_GEN2,):
+      self.STEER_MAX = self.STEER_MAX_GEN2
+      self.STEER_MAX_LOOKUP = self.STEER_MAX_LOOKUP_GEN2
+      # Gen2 improvements: faster response, better precision
+      self.STEER_DELTA_UP = 4
+      self.STEER_DELTA_DOWN = 6
+      self.STEER_DRIVER_ALLOWANCE = 120  # Slightly more tolerance for driver input
+    else:
+      # Gen1 defaults
+      self.STEER_MAX = self.STEER_MAX_GEN1
+      self.STEER_MAX_LOOKUP = self.STEER_MAX_LOOKUP_GEN1
 
 
 class RivianSafetyFlags(IntFlag):
